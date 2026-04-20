@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"droplock/backend/internal/transfer"
+	"droplock-backend/internal/transfer"
 )
 
 const (
