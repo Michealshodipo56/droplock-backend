@@ -15,6 +15,12 @@ type Session struct {
 	ConnectedAt time.Time `json:"connectedAt"`
 }
 
+type Locker struct {
+	Name         string    `json:"name"`
+	PasswordHash string    `json:"-"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
 type StoredFile struct {
 	ID          string
 	Name        string
@@ -38,6 +44,7 @@ type Store struct {
 	sessions       map[string]Session
 	transfers      map[string]Transfer
 	transfersByTgt map[string][]string
+	lockers        map[string]Locker
 	offlineAfter   time.Duration
 	transferTTL    time.Duration
 }
@@ -47,6 +54,7 @@ func NewStore(offlineAfter, transferTTL time.Duration) *Store {
 		sessions:       make(map[string]Session),
 		transfers:      make(map[string]Transfer),
 		transfersByTgt: make(map[string][]string),
+		lockers:        make(map[string]Locker),
 		offlineAfter:   offlineAfter,
 		transferTTL:    transferTTL,
 	}
@@ -199,6 +207,37 @@ func (s *Store) DownloadFile(sessionID, transferID, fileID string) (StoredFile, 
 		}
 	}
 	return StoredFile{}, false
+}
+
+func (s *Store) CheckLocker(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.lockers[name]
+	return ok
+}
+
+func (s *Store) CreateLocker(name, passwordHash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.lockers[name]; ok {
+		return false
+	}
+	s.lockers[name] = Locker{
+		Name:         name,
+		PasswordHash: passwordHash,
+		CreatedAt:    time.Now().UTC(),
+	}
+	return true
+}
+
+func (s *Store) VerifyLocker(name, passwordHash string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	locker, ok := s.lockers[name]
+	if !ok {
+		return false
+	}
+	return locker.PasswordHash == passwordHash
 }
 
 func randomID(size int) string {

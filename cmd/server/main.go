@@ -68,6 +68,9 @@ func main() {
 	mux.HandleFunc("/api/transfers", srv.handleTransfers)
 	mux.HandleFunc("/api/transfers/inbox", srv.handleInbox)
 	mux.HandleFunc("/api/transfers/", srv.handleTransferDownload)
+	mux.HandleFunc("/api/locker/check", srv.handleLockerCheck)
+	mux.HandleFunc("/api/locker/create", srv.handleLockerCreate)
+	mux.HandleFunc("/api/locker/open", srv.handleLockerOpen)
 
 	staticFS := http.FileServer(http.Dir("."))
 	mux.Handle("/", staticFS)
@@ -295,6 +298,79 @@ func (s *server) handleTransferDownload(w http.ResponseWriter, r *http.Request) 
 
 func transferFileID() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+func (s *server) handleLockerCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	exists := s.store.CheckLocker(req.Name)
+	writeJSON(w, http.StatusOK, map[string]any{"exists": exists})
+}
+
+func (s *server) handleLockerCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	if req.Name == "" || req.Password == "" {
+		http.Error(w, "name and password are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.CreateLocker(req.Name, req.Password) {
+		http.Error(w, "locker already exists", http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"success": true})
+}
+
+func (s *server) handleLockerOpen(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	if req.Name == "" || req.Password == "" {
+		http.Error(w, "name and password are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.VerifyLocker(req.Name, req.Password) {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
