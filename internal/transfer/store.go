@@ -15,10 +15,30 @@ type Session struct {
 	ConnectedAt time.Time `json:"connectedAt"`
 }
 
+type Note struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type LockerFile struct {
+	ID          string    `json:"id"`
+	NoteID      string    `json:"noteId"`
+	Name        string    `json:"name"`
+	ContentType string    `json:"contentType"`
+	Size        int64     `json:"size"`
+	Content     []byte    `json:"-"`
+	UploadedAt  time.Time `json:"uploadedAt"`
+}
+
 type Locker struct {
-	Name         string    `json:"name"`
-	PasswordHash string    `json:"-"`
-	CreatedAt    time.Time `json:"createdAt"`
+	Name         string                 `json:"name"`
+	PasswordHash string                 `json:"-"`
+	CreatedAt    time.Time              `json:"createdAt"`
+	Notes        map[string]*Note       `json:"-"`
+	Files        map[string]*LockerFile `json:"-"`
 }
 
 type StoredFile struct {
@@ -226,6 +246,8 @@ func (s *Store) CreateLocker(name, passwordHash string) bool {
 		Name:         name,
 		PasswordHash: passwordHash,
 		CreatedAt:    time.Now().UTC(),
+		Notes:        make(map[string]*Note),
+		Files:        make(map[string]*LockerFile),
 	}
 	return true
 }
@@ -238,6 +260,168 @@ func (s *Store) VerifyLocker(name, passwordHash string) bool {
 		return false
 	}
 	return locker.PasswordHash == passwordHash
+}
+
+// --- Note CRUD ---
+
+func (s *Store) SaveNote(lockerName, password, noteID, title, content string) (*Note, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return nil, false
+	}
+	now := time.Now().UTC()
+	if locker.Notes == nil {
+		locker.Notes = make(map[string]*Note)
+	}
+	existing, exists := locker.Notes[noteID]
+	if exists {
+		existing.Title = title
+		existing.Content = content
+		existing.UpdatedAt = now
+	} else {
+		existing = &Note{
+			ID:        noteID,
+			Title:     title,
+			Content:   content,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		locker.Notes[noteID] = existing
+	}
+	s.lockers[lockerName] = locker
+	return existing, true
+}
+
+func (s *Store) DeleteNote(lockerName, password, noteID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return false
+	}
+	if locker.Notes == nil {
+		return false
+	}
+	delete(locker.Notes, noteID)
+	// Also remove files attached to this note
+	if locker.Files != nil {
+		for fid, f := range locker.Files {
+			if f.NoteID == noteID {
+				delete(locker.Files, fid)
+			}
+		}
+	}
+	s.lockers[lockerName] = locker
+	return true
+}
+
+func (s *Store) ListNotes(lockerName, password string) ([]Note, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return nil, false
+	}
+	out := make([]Note, 0, len(locker.Notes))
+	for _, n := range locker.Notes {
+		out = append(out, *n)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, true
+}
+
+// --- File CRUD ---
+
+func (s *Store) UploadLockerFile(lockerName, password, noteID, fileName, contentType string, size int64, content []byte) (*LockerFile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return nil, false
+	}
+	if locker.Files == nil {
+		locker.Files = make(map[string]*LockerFile)
+	}
+	f := &LockerFile{
+		ID:          randomID(12),
+		NoteID:      noteID,
+		Name:        fileName,
+		ContentType: contentType,
+		Size:        size,
+		Content:     content,
+		UploadedAt:  time.Now().UTC(),
+	}
+	locker.Files[f.ID] = f
+	s.lockers[lockerName] = locker
+	return f, true
+}
+
+func (s *Store) ListLockerFiles(lockerName, password string) ([]LockerFile, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return nil, false
+	}
+	out := make([]LockerFile, 0, len(locker.Files))
+	for _, f := range locker.Files {
+		out = append(out, LockerFile{
+			ID:          f.ID,
+			NoteID:      f.NoteID,
+			Name:        f.Name,
+			ContentType: f.ContentType,
+			Size:        f.Size,
+			UploadedAt:  f.UploadedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UploadedAt.After(out[j].UploadedAt)
+	})
+	return out, true
+}
+
+func (s *Store) ListLockerFilesByNote(lockerName, password, noteID string) ([]LockerFile, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return nil, false
+	}
+	var out []LockerFile
+	for _, f := range locker.Files {
+		if f.NoteID == noteID {
+			out = append(out, LockerFile{
+				ID:          f.ID,
+				NoteID:      f.NoteID,
+				Name:        f.Name,
+				ContentType: f.ContentType,
+				Size:        f.Size,
+				UploadedAt:  f.UploadedAt,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UploadedAt.After(out[j].UploadedAt)
+	})
+	return out, true
+}
+
+func (s *Store) DownloadLockerFile(lockerName, password, fileID string) (*LockerFile, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return nil, false
+	}
+	f, ok := locker.Files[fileID]
+	if !ok {
+		return nil, false
+	}
+	return f, true
 }
 
 func randomID(size int) string {

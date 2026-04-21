@@ -71,8 +71,18 @@ func main() {
 	mux.HandleFunc("/api/locker/check", srv.handleLockerCheck)
 	mux.HandleFunc("/api/locker/create", srv.handleLockerCreate)
 	mux.HandleFunc("/api/locker/open", srv.handleLockerOpen)
+	mux.HandleFunc("/api/locker/notes", srv.handleLockerNotes)
+	mux.HandleFunc("/api/locker/notes/delete", srv.handleLockerNoteDelete)
+	mux.HandleFunc("/api/locker/files", srv.handleLockerFiles)
+	mux.HandleFunc("/api/locker/files/upload", srv.handleLockerFileUpload)
+	mux.HandleFunc("/api/locker/files/download", srv.handleLockerFileDownload)
 
-	staticFS := http.FileServer(http.Dir("."))
+	// Serve frontend from the droplock/ directory
+	frontendDir := "../../../droplock"
+	if _, err := os.Stat(frontendDir); os.IsNotExist(err) {
+		frontendDir = "."
+	}
+	staticFS := http.FileServer(http.Dir(frontendDir))
 	mux.Handle("/", staticFS)
 
 	addr := os.Getenv("PORT")
@@ -371,6 +381,197 @@ func (s *server) handleLockerOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+// --- Notes ---
+
+func (s *server) handleLockerNotes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		name := strings.TrimSpace(r.URL.Query().Get("name"))
+		password := strings.TrimSpace(r.URL.Query().Get("password"))
+		if name == "" || password == "" {
+			http.Error(w, "name and password are required", http.StatusBadRequest)
+			return
+		}
+		notes, ok := s.store.ListNotes(name, password)
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"notes": notes})
+
+	case http.MethodPost:
+		var req struct {
+			Name     string `json:"name"`
+			Password string `json:"password"`
+			NoteID   string `json:"noteId"`
+			Title    string `json:"title"`
+			Content  string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		req.Name = strings.TrimSpace(req.Name)
+		req.Password = strings.TrimSpace(req.Password)
+		req.NoteID = strings.TrimSpace(req.NoteID)
+		if req.Name == "" || req.Password == "" || req.NoteID == "" {
+			http.Error(w, "name, password, and noteId are required", http.StatusBadRequest)
+			return
+		}
+		if req.Title == "" {
+			req.Title = "Untitled"
+		}
+		note, ok := s.store.SaveNote(req.Name, req.Password, req.NoteID, req.Title, req.Content)
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"note": note})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *server) handleLockerNoteDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+		NoteID   string `json:"noteId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	req.NoteID = strings.TrimSpace(req.NoteID)
+	if req.Name == "" || req.Password == "" || req.NoteID == "" {
+		http.Error(w, "name, password, and noteId are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.DeleteNote(req.Name, req.Password, req.NoteID) {
+		http.Error(w, "invalid credentials or note not found", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+// --- Files ---
+
+func (s *server) handleLockerFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	password := strings.TrimSpace(r.URL.Query().Get("password"))
+	noteID := strings.TrimSpace(r.URL.Query().Get("noteId"))
+	if name == "" || password == "" {
+		http.Error(w, "name and password are required", http.StatusBadRequest)
+		return
+	}
+	if noteID != "" {
+		files, ok := s.store.ListLockerFilesByNote(name, password, noteID)
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"files": files})
+	} else {
+		files, ok := s.store.ListLockerFiles(name, password)
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"files": files})
+	}
+}
+
+func (s *server) handleLockerFileUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, fmt.Sprintf("invalid multipart payload: %v", err), http.StatusBadRequest)
+		return
+	}
+	lockerName := strings.TrimSpace(r.FormValue("name"))
+	password := strings.TrimSpace(r.FormValue("password"))
+	noteID := strings.TrimSpace(r.FormValue("noteId"))
+	if lockerName == "" || password == "" || noteID == "" {
+		http.Error(w, "name, password, and noteId are required", http.StatusBadRequest)
+		return
+	}
+
+	headers := r.MultipartForm.File["files"]
+	if len(headers) == 0 {
+		http.Error(w, "at least one file is required", http.StatusBadRequest)
+		return
+	}
+
+	var uploaded []map[string]any
+	for _, header := range headers {
+		f, err := header.Open()
+		if err != nil {
+			http.Error(w, "unable to read uploaded file", http.StatusBadRequest)
+			return
+		}
+		data, err := io.ReadAll(f)
+		_ = f.Close()
+		if err != nil {
+			http.Error(w, "unable to read uploaded file", http.StatusBadRequest)
+			return
+		}
+		ctype := header.Header.Get("Content-Type")
+		if ctype == "" {
+			ctype = mime.TypeByExtension(path.Ext(header.Filename))
+		}
+		if ctype == "" {
+			ctype = "application/octet-stream"
+		}
+		lf, ok := s.store.UploadLockerFile(lockerName, password, noteID, header.Filename, ctype, int64(len(data)), data)
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		uploaded = append(uploaded, map[string]any{
+			"id":   lf.ID,
+			"name": lf.Name,
+			"size": lf.Size,
+		})
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"files": uploaded})
+}
+
+func (s *server) handleLockerFileDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	password := strings.TrimSpace(r.URL.Query().Get("password"))
+	fileID := strings.TrimSpace(r.URL.Query().Get("fileId"))
+	if name == "" || password == "" || fileID == "" {
+		http.Error(w, "name, password, and fileId are required", http.StatusBadRequest)
+		return
+	}
+	lf, ok := s.store.DownloadLockerFile(name, password, fileID)
+	if !ok {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", lf.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(lf.Size, 10))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", lf.Name))
+	_, _ = w.Write(lf.Content)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
