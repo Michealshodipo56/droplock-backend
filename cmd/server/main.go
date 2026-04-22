@@ -58,7 +58,11 @@ type inboxResp struct {
 }
 
 func main() {
-	srv := &server{store: transfer.NewStore(offlineAfter, transferTTL)}
+	lockerDataPath := os.Getenv("DROPLOCK_DATA_FILE")
+	if strings.TrimSpace(lockerDataPath) == "" {
+		lockerDataPath = "droplock-data.json"
+	}
+	srv := &server{store: transfer.NewStore(offlineAfter, transferTTL, lockerDataPath)}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/presence/register", srv.handleRegister)
@@ -76,6 +80,7 @@ func main() {
 	mux.HandleFunc("/api/locker/files", srv.handleLockerFiles)
 	mux.HandleFunc("/api/locker/files/upload", srv.handleLockerFileUpload)
 	mux.HandleFunc("/api/locker/files/download", srv.handleLockerFileDownload)
+	mux.HandleFunc("/api/locker/files/delete", srv.handleLockerFileDelete)
 
 	// Serve frontend from the droplock/ directory
 	frontendDir := "../../../droplock"
@@ -572,6 +577,38 @@ func (s *server) handleLockerFileDownload(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Length", strconv.FormatInt(lf.Size, 10))
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", lf.Name))
 	_, _ = w.Write(lf.Content)
+}
+
+func (s *server) handleLockerFileDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+		FileID   string `json:"fileId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	req.FileID = strings.TrimSpace(req.FileID)
+	if req.Name == "" || req.Password == "" || req.FileID == "" {
+		http.Error(w, "name, password, and fileId are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.VerifyLocker(req.Name, req.Password) {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	if !s.store.DeleteLockerFile(req.Name, req.Password, req.FileID) {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

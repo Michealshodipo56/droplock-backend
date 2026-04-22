@@ -3,6 +3,9 @@ package transfer
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"log"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -67,9 +70,10 @@ type Store struct {
 	lockers        map[string]Locker
 	offlineAfter   time.Duration
 	transferTTL    time.Duration
+	persistPath    string
 }
 
-func NewStore(offlineAfter, transferTTL time.Duration) *Store {
+func NewStore(offlineAfter, transferTTL time.Duration, persistPath string) *Store {
 	s := &Store{
 		sessions:       make(map[string]Session),
 		transfers:      make(map[string]Transfer),
@@ -77,9 +81,23 @@ func NewStore(offlineAfter, transferTTL time.Duration) *Store {
 		lockers:        make(map[string]Locker),
 		offlineAfter:   offlineAfter,
 		transferTTL:    transferTTL,
+		persistPath:    persistPath,
 	}
+	s.loadLockerData()
 	go s.cleanupLoop()
 	return s
+}
+
+type persistedLocker struct {
+	Name         string                 `json:"name"`
+	PasswordHash string                 `json:"passwordHash"`
+	CreatedAt    time.Time              `json:"createdAt"`
+	Notes        map[string]*Note       `json:"notes"`
+	Files        map[string]*LockerFile `json:"files"`
+}
+
+type lockerDataFile struct {
+	Lockers map[string]persistedLocker `json:"lockers"`
 }
 
 func (s *Store) cleanupLoop() {
@@ -249,6 +267,7 @@ func (s *Store) CreateLocker(name, passwordHash string) bool {
 		Notes:        make(map[string]*Note),
 		Files:        make(map[string]*LockerFile),
 	}
+	s.persistLockerDataLocked()
 	return true
 }
 
@@ -291,6 +310,7 @@ func (s *Store) SaveNote(lockerName, password, noteID, title, content string) (*
 		locker.Notes[noteID] = existing
 	}
 	s.lockers[lockerName] = locker
+	s.persistLockerDataLocked()
 	return existing, true
 }
 
@@ -314,6 +334,7 @@ func (s *Store) DeleteNote(lockerName, password, noteID string) bool {
 		}
 	}
 	s.lockers[lockerName] = locker
+	s.persistLockerDataLocked()
 	return true
 }
 
@@ -357,6 +378,7 @@ func (s *Store) UploadLockerFile(lockerName, password, noteID, fileName, content
 	}
 	locker.Files[f.ID] = f
 	s.lockers[lockerName] = locker
+	s.persistLockerDataLocked()
 	return f, true
 }
 
@@ -424,6 +446,25 @@ func (s *Store) DownloadLockerFile(lockerName, password, fileID string) (*Locker
 	return f, true
 }
 
+func (s *Store) DeleteLockerFile(lockerName, password, fileID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[lockerName]
+	if !ok || locker.PasswordHash != password {
+		return false
+	}
+	if locker.Files == nil {
+		return false
+	}
+	if _, exists := locker.Files[fileID]; !exists {
+		return false
+	}
+	delete(locker.Files, fileID)
+	s.lockers[lockerName] = locker
+	s.persistLockerDataLocked()
+	return true
+}
+
 func randomID(size int) string {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
@@ -443,4 +484,73 @@ func removeID(ids []string, value string) []string {
 		}
 	}
 	return out
+}
+
+func (s *Store) loadLockerData() {
+	if s.persistPath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.persistPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("unable to read locker data file %q: %v", s.persistPath, err)
+		}
+		return
+	}
+	var state lockerDataFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("unable to parse locker data file %q: %v", s.persistPath, err)
+		return
+	}
+	if state.Lockers == nil {
+		state.Lockers = make(map[string]persistedLocker)
+	}
+	s.lockers = make(map[string]Locker, len(state.Lockers))
+	for key, item := range state.Lockers {
+		notes := item.Notes
+		files := item.Files
+		if notes == nil {
+			notes = make(map[string]*Note)
+		}
+		if files == nil {
+			files = make(map[string]*LockerFile)
+		}
+		s.lockers[key] = Locker{
+			Name:         item.Name,
+			PasswordHash: item.PasswordHash,
+			CreatedAt:    item.CreatedAt,
+			Notes:        notes,
+			Files:        files,
+		}
+	}
+}
+
+func (s *Store) persistLockerDataLocked() {
+	if s.persistPath == "" {
+		return
+	}
+	lockers := make(map[string]persistedLocker, len(s.lockers))
+	for key, item := range s.lockers {
+		lockers[key] = persistedLocker{
+			Name:         item.Name,
+			PasswordHash: item.PasswordHash,
+			CreatedAt:    item.CreatedAt,
+			Notes:        item.Notes,
+			Files:        item.Files,
+		}
+	}
+	state := lockerDataFile{Lockers: lockers}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		log.Printf("unable to marshal locker data: %v", err)
+		return
+	}
+	tmpPath := s.persistPath + ".tmp"
+	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
+		log.Printf("unable to write locker data temp file %q: %v", tmpPath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, s.persistPath); err != nil {
+		log.Printf("unable to swap locker data file %q: %v", s.persistPath, err)
+	}
 }
