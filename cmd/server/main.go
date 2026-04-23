@@ -1,16 +1,20 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
+	"net/smtp"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"droplock-backend/internal/transfer"
@@ -23,8 +27,15 @@ const (
 	defaultServeAddr = ":8080"
 )
 
+type recoveryTokenEntry struct {
+	lockerName string
+	expiresAt  time.Time
+}
+
 type server struct {
-	store *transfer.Store
+	store          *transfer.Store
+	mu             sync.Mutex
+	recoveryTokens map[string]recoveryTokenEntry
 }
 
 type registerReq struct {
@@ -62,7 +73,10 @@ func main() {
 	if strings.TrimSpace(lockerDataPath) == "" {
 		lockerDataPath = "droplock-data.json"
 	}
-	srv := &server{store: transfer.NewStore(offlineAfter, transferTTL, lockerDataPath)}
+	srv := &server{
+		store:          transfer.NewStore(offlineAfter, transferTTL, lockerDataPath),
+		recoveryTokens: make(map[string]recoveryTokenEntry),
+	}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/presence/register", srv.handleRegister)
@@ -83,6 +97,11 @@ func main() {
 	mux.HandleFunc("/api/locker/files/delete", srv.handleLockerFileDelete)
 	mux.HandleFunc("/api/locker/delete", srv.handleLockerDelete)
 	mux.HandleFunc("/api/locker/change-password", srv.handleLockerChangePassword)
+	mux.HandleFunc("/api/locker/set-email", srv.handleLockerSetEmail)
+	mux.HandleFunc("/api/locker/get-email", srv.handleLockerGetEmail)
+	mux.HandleFunc("/api/locker/recover/send-code", srv.handleLockerRecoverSendCode)
+	mux.HandleFunc("/api/locker/recover/verify-code", srv.handleLockerRecoverVerifyCode)
+	mux.HandleFunc("/api/locker/recover/reset-password", srv.handleLockerRecoverResetPassword)
 
 	// Serve frontend from the droplock/ directory
 	frontendDir := "../../../droplock"
@@ -665,6 +684,227 @@ func (s *server) handleLockerChangePassword(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"changed": true})
+}
+
+// --- Recovery / Secure Account Handlers ---
+
+func (s *server) handleLockerSetEmail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Name == "" || req.Password == "" || req.Email == "" {
+		http.Error(w, "name, password and email are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.SetLockerEmail(req.Name, req.Password, req.Email) {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+func (s *server) handleLockerGetEmail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	if req.Name == "" || req.Password == "" {
+		http.Error(w, "name and password are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.VerifyLocker(req.Name, req.Password) {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	email, _ := s.store.GetLockerEmail(req.Name)
+	writeJSON(w, http.StatusOK, map[string]any{"email": email})
+}
+
+func (s *server) handleLockerRecoverSendCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Name == "" || req.Email == "" {
+		http.Error(w, "name and email are required", http.StatusBadRequest)
+		return
+	}
+
+	// Check if locker exists
+	if !s.store.CheckLocker(req.Name) {
+		http.Error(w, "locker not found", http.StatusNotFound)
+		return
+	}
+
+	// Check if email matches
+	storedEmail, hasEmail := s.store.GetLockerEmail(req.Name)
+	if !hasEmail || storedEmail != req.Email {
+		http.Error(w, "email does not match the recovery email on file", http.StatusUnauthorized)
+		return
+	}
+
+	// Generate OTP
+	code, err := s.store.CreateRecoveryOTP(req.Name)
+	if err != nil {
+		http.Error(w, "failed to generate recovery code", http.StatusInternalServerError)
+		return
+	}
+
+	// Attempt SMTP delivery
+	smtpEmail := strings.TrimSpace(os.Getenv("SMTP_EMAIL"))
+	smtpPassword := strings.TrimSpace(os.Getenv("SMTP_PASSWORD"))
+	smtpHost := strings.TrimSpace(os.Getenv("SMTP_HOST"))
+	smtpPort := strings.TrimSpace(os.Getenv("SMTP_PORT"))
+	if smtpHost == "" {
+		smtpHost = "smtp.gmail.com"
+	}
+	if smtpPort == "" {
+		smtpPort = "587"
+	}
+
+	if smtpEmail != "" && smtpPassword != "" {
+		go func() {
+			if err := sendRecoveryEmail(req.Email, code, smtpHost, smtpPort, smtpEmail, smtpPassword); err != nil {
+				log.Printf("[SMTP] Failed to send recovery email to %s: %v", req.Email, err)
+			} else {
+				log.Printf("[SMTP] Recovery code sent to %s", req.Email)
+			}
+		}()
+	} else {
+		log.Printf("[DEV] Recovery OTP for locker %q → %s (SMTP not configured)", req.Name, code)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"sent": true})
+}
+
+func (s *server) handleLockerRecoverVerifyCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Code = strings.TrimSpace(req.Code)
+	if req.Name == "" || req.Code == "" {
+		http.Error(w, "name and code are required", http.StatusBadRequest)
+		return
+	}
+
+	if !s.store.VerifyRecoveryOTP(req.Name, req.Code) {
+		http.Error(w, "invalid or expired code", http.StatusUnauthorized)
+		return
+	}
+
+	// Generate a one-time recovery token
+	tokenBytes := make([]byte, 24)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	s.mu.Lock()
+	s.recoveryTokens[token] = recoveryTokenEntry{
+		lockerName: req.Name,
+		expiresAt:  time.Now().UTC().Add(10 * time.Minute),
+	}
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"verified": true, "token": token})
+}
+
+func (s *server) handleLockerRecoverResetPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Token       string `json:"token"`
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Token = strings.TrimSpace(req.Token)
+	req.NewPassword = strings.TrimSpace(req.NewPassword)
+	if req.Token == "" || req.NewPassword == "" {
+		http.Error(w, "token and newPassword are required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	entry, ok := s.recoveryTokens[req.Token]
+	if !ok || time.Now().UTC().After(entry.expiresAt) {
+		delete(s.recoveryTokens, req.Token)
+		s.mu.Unlock()
+		http.Error(w, "invalid or expired recovery token", http.StatusUnauthorized)
+		return
+	}
+	lockerName := entry.lockerName
+	delete(s.recoveryTokens, req.Token)
+	s.mu.Unlock()
+
+	if !s.store.ResetLockerPassword(lockerName, req.NewPassword) {
+		http.Error(w, "locker not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reset": true})
+}
+
+func sendRecoveryEmail(toEmail, code, smtpHost, smtpPort, smtpEmail, smtpPassword string) error {
+	auth := smtp.PlainAuth("", smtpEmail, smtpPassword, smtpHost)
+	subject := "DropLock Recovery Code"
+	body := fmt.Sprintf(
+		"Your DropLock recovery verification code is:\n\n    %s\n\nThis code expires in 10 minutes.\nIf you did not request this, please ignore this email.",
+		code,
+	)
+	msg := fmt.Sprintf(
+		"From: DropLock <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s",
+		smtpEmail, toEmail, subject, body,
+	)
+	addr := fmt.Sprintf("%s:%s", smtpHost, smtpPort)
+	return smtp.SendMail(addr, auth, smtpEmail, []string{toEmail}, []byte(msg))
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

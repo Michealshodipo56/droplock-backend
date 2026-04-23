@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"sort"
 	"sync"
@@ -37,11 +39,12 @@ type LockerFile struct {
 }
 
 type Locker struct {
-	Name         string                 `json:"name"`
-	PasswordHash string                 `json:"-"`
-	CreatedAt    time.Time              `json:"createdAt"`
-	Notes        map[string]*Note       `json:"-"`
-	Files        map[string]*LockerFile `json:"-"`
+	Name          string                 `json:"name"`
+	PasswordHash  string                 `json:"-"`
+	RecoveryEmail string                 `json:"-"`
+	CreatedAt     time.Time              `json:"createdAt"`
+	Notes         map[string]*Note       `json:"-"`
+	Files         map[string]*LockerFile `json:"-"`
 }
 
 type StoredFile struct {
@@ -62,12 +65,18 @@ type Transfer struct {
 	CreatedAt     time.Time
 }
 
+type otpEntry struct {
+	Code      string
+	ExpiresAt time.Time
+}
+
 type Store struct {
 	mu             sync.RWMutex
 	sessions       map[string]Session
 	transfers      map[string]Transfer
 	transfersByTgt map[string][]string
 	lockers        map[string]Locker
+	otps           map[string]otpEntry // key: lockerName
 	offlineAfter   time.Duration
 	transferTTL    time.Duration
 	persistPath    string
@@ -79,6 +88,7 @@ func NewStore(offlineAfter, transferTTL time.Duration, persistPath string) *Stor
 		transfers:      make(map[string]Transfer),
 		transfersByTgt: make(map[string][]string),
 		lockers:        make(map[string]Locker),
+		otps:           make(map[string]otpEntry),
 		offlineAfter:   offlineAfter,
 		transferTTL:    transferTTL,
 		persistPath:    persistPath,
@@ -89,11 +99,12 @@ func NewStore(offlineAfter, transferTTL time.Duration, persistPath string) *Stor
 }
 
 type persistedLocker struct {
-	Name         string                 `json:"name"`
-	PasswordHash string                 `json:"passwordHash"`
-	CreatedAt    time.Time              `json:"createdAt"`
-	Notes        map[string]*Note       `json:"notes"`
-	Files        map[string]*LockerFile `json:"files"`
+	Name          string                 `json:"name"`
+	PasswordHash  string                 `json:"passwordHash"`
+	RecoveryEmail string                 `json:"recoveryEmail"`
+	CreatedAt     time.Time              `json:"createdAt"`
+	Notes         map[string]*Note       `json:"notes"`
+	Files         map[string]*LockerFile `json:"files"`
 }
 
 type lockerDataFile struct {
@@ -541,11 +552,12 @@ func (s *Store) loadLockerData() {
 			files = make(map[string]*LockerFile)
 		}
 		s.lockers[key] = Locker{
-			Name:         item.Name,
-			PasswordHash: item.PasswordHash,
-			CreatedAt:    item.CreatedAt,
-			Notes:        notes,
-			Files:        files,
+			Name:          item.Name,
+			PasswordHash:  item.PasswordHash,
+			RecoveryEmail: item.RecoveryEmail,
+			CreatedAt:     item.CreatedAt,
+			Notes:         notes,
+			Files:         files,
 		}
 	}
 }
@@ -557,11 +569,12 @@ func (s *Store) persistLockerDataLocked() {
 	lockers := make(map[string]persistedLocker, len(s.lockers))
 	for key, item := range s.lockers {
 		lockers[key] = persistedLocker{
-			Name:         item.Name,
-			PasswordHash: item.PasswordHash,
-			CreatedAt:    item.CreatedAt,
-			Notes:        item.Notes,
-			Files:        item.Files,
+			Name:          item.Name,
+			PasswordHash:  item.PasswordHash,
+			RecoveryEmail: item.RecoveryEmail,
+			CreatedAt:     item.CreatedAt,
+			Notes:         item.Notes,
+			Files:         item.Files,
 		}
 	}
 	state := lockerDataFile{Lockers: lockers}
@@ -578,4 +591,77 @@ func (s *Store) persistLockerDataLocked() {
 	if err := os.Rename(tmpPath, s.persistPath); err != nil {
 		log.Printf("unable to swap locker data file %q: %v", s.persistPath, err)
 	}
+}
+
+func (s *Store) SetLockerEmail(name, passwordHash, email string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[name]
+	if !ok || locker.PasswordHash != passwordHash {
+		return false
+	}
+	locker.RecoveryEmail = email
+	s.lockers[name] = locker
+	s.persistLockerDataLocked()
+	return true
+}
+
+func (s *Store) GetLockerEmail(name string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	locker, ok := s.lockers[name]
+	if !ok {
+		return "", false
+	}
+	return locker.RecoveryEmail, locker.RecoveryEmail != ""
+}
+
+func (s *Store) CreateRecoveryOTP(lockerName string) (string, error) {
+	const digits = "0123456789"
+	code := make([]byte, 6)
+	for i := range code {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(digits))))
+		if err != nil {
+			return "", fmt.Errorf("otp generation failed: %w", err)
+		}
+		code[i] = digits[n.Int64()]
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.otps[lockerName] = otpEntry{
+		Code:      string(code),
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
+	}
+	return string(code), nil
+}
+
+func (s *Store) VerifyRecoveryOTP(lockerName, code string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.otps[lockerName]
+	if !ok {
+		return false
+	}
+	if time.Now().UTC().After(entry.ExpiresAt) {
+		delete(s.otps, lockerName)
+		return false
+	}
+	if entry.Code != code {
+		return false
+	}
+	delete(s.otps, lockerName)
+	return true
+}
+
+func (s *Store) ResetLockerPassword(name, newPasswordHash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[name]
+	if !ok {
+		return false
+	}
+	locker.PasswordHash = newPasswordHash
+	s.lockers[name] = locker
+	s.persistLockerDataLocked()
+	return true
 }
