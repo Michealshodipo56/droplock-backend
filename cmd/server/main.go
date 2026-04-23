@@ -81,6 +81,7 @@ func main() {
 	mux.HandleFunc("/api/locker/files/upload", srv.handleLockerFileUpload)
 	mux.HandleFunc("/api/locker/files/download", srv.handleLockerFileDownload)
 	mux.HandleFunc("/api/locker/files/delete", srv.handleLockerFileDelete)
+	mux.HandleFunc("/api/locker/delete", srv.handleLockerDelete)
 
 	// Serve frontend from the droplock/ directory
 	frontendDir := "../../../droplock"
@@ -609,6 +610,32 @@ func (s *server) handleLockerFileDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+func (s *server) handleLockerDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Password = strings.TrimSpace(req.Password)
+	if req.Name == "" || req.Password == "" {
+		http.Error(w, "name and password are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.DeleteLocker(req.Name, req.Password) {
+		http.Error(w, "invalid credentials or locker not found", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
