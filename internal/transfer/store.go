@@ -293,6 +293,19 @@ func (s *Store) DeleteLocker(name, passwordHash string) bool {
 	return true
 }
 
+func (s *Store) ChangeLockerPassword(name, oldPasswordHash, newPasswordHash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locker, ok := s.lockers[name]
+	if !ok || locker.PasswordHash != oldPasswordHash {
+		return false
+	}
+	locker.PasswordHash = newPasswordHash
+	s.lockers[name] = locker
+	s.persistLockerDataLocked()
+	return true
+}
+
 // --- Note CRUD ---
 
 func (s *Store) SaveNote(lockerName, password, noteID, title, content string) (*Note, bool) {

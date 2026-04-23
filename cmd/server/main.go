@@ -82,6 +82,7 @@ func main() {
 	mux.HandleFunc("/api/locker/files/download", srv.handleLockerFileDownload)
 	mux.HandleFunc("/api/locker/files/delete", srv.handleLockerFileDelete)
 	mux.HandleFunc("/api/locker/delete", srv.handleLockerDelete)
+	mux.HandleFunc("/api/locker/change-password", srv.handleLockerChangePassword)
 
 	// Serve frontend from the droplock/ directory
 	frontendDir := "../../../droplock"
@@ -636,6 +637,34 @@ func (s *server) handleLockerDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func (s *server) handleLockerChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		OldPassword string `json:"oldPassword"`
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.OldPassword = strings.TrimSpace(req.OldPassword)
+	req.NewPassword = strings.TrimSpace(req.NewPassword)
+	if req.Name == "" || req.OldPassword == "" || req.NewPassword == "" {
+		http.Error(w, "name, oldPassword and newPassword are required", http.StatusBadRequest)
+		return
+	}
+	if !s.store.ChangeLockerPassword(req.Name, req.OldPassword, req.NewPassword) {
+		http.Error(w, "incorrect old password or locker not found", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"changed": true})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
