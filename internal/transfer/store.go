@@ -49,11 +49,11 @@ type Locker struct {
 }
 
 type StoredFile struct {
-	ID          string
-	Name        string
-	ContentType string
-	Size        int64
-	Content     []byte
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ContentType string `json:"contentType"`
+	Size        int64  `json:"size"`
+	Content     []byte `json:"-"`
 }
 
 type Transfer struct {
