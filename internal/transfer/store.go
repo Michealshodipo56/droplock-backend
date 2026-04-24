@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -70,16 +71,26 @@ type otpEntry struct {
 	ExpiresAt time.Time
 }
 
+type CodeTransfer struct {
+	Code      string       `json:"code"`
+	SenderID  string       `json:"senderId"`
+	Files     []StoredFile `json:"-"`
+	FileMeta  []StoredFile `json:"files"` // sent without content
+	CreatedAt time.Time    `json:"createdAt"`
+	ExpiresAt time.Time    `json:"expiresAt"`
+}
+
 type Store struct {
-	mu             sync.RWMutex
-	sessions       map[string]Session
-	transfers      map[string]Transfer
-	transfersByTgt map[string][]string
-	lockers        map[string]Locker
-	otps           map[string]otpEntry // key: lockerName
-	offlineAfter   time.Duration
-	transferTTL    time.Duration
-	persistPath    string
+	mu              sync.RWMutex
+	sessions        map[string]Session
+	transfers       map[string]Transfer
+	transfersByTgt  map[string][]string
+	lockers         map[string]Locker
+	otps            map[string]otpEntry // key: lockerName
+	codeTransfers   map[string]*CodeTransfer // key: code
+	offlineAfter    time.Duration
+	transferTTL     time.Duration
+	persistPath     string
 }
 
 func NewStore(offlineAfter, transferTTL time.Duration, persistPath string) *Store {
@@ -89,6 +100,7 @@ func NewStore(offlineAfter, transferTTL time.Duration, persistPath string) *Stor
 		transfersByTgt: make(map[string][]string),
 		lockers:        make(map[string]Locker),
 		otps:           make(map[string]otpEntry),
+		codeTransfers:  make(map[string]*CodeTransfer),
 		offlineAfter:   offlineAfter,
 		transferTTL:    transferTTL,
 		persistPath:    persistPath,
@@ -135,6 +147,12 @@ func (s *Store) Cleanup() {
 			delete(s.transfers, id)
 			ids := s.transfersByTgt[transfer.TargetSession]
 			s.transfersByTgt[transfer.TargetSession] = removeID(ids, id)
+		}
+	}
+
+	for code, ct := range s.codeTransfers {
+		if now.After(ct.ExpiresAt) {
+			delete(s.codeTransfers, code)
 		}
 	}
 }
@@ -225,6 +243,75 @@ func (s *Store) AddTransfer(senderSession, senderName, targetSession, targetName
 	s.transfers[transfer.ID] = transfer
 	s.transfersByTgt[targetSession] = append(s.transfersByTgt[targetSession], transfer.ID)
 	return transfer
+}
+
+// --- Encrypted (Code) Transfers ---
+
+func (s *Store) AddCodeTransfer(senderSession string, files []StoredFile) *CodeTransfer {
+	// Generate an 8-character random code
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	var code string
+	for {
+		b := make([]byte, 8)
+		rand.Read(b)
+		for i := range b {
+			b[i] = chars[int(b[i])%len(chars)]
+		}
+		code = string(b)
+		s.mu.RLock()
+		_, exists := s.codeTransfers[code]
+		s.mu.RUnlock()
+		if !exists {
+			break
+		}
+	}
+
+	now := time.Now().UTC()
+	ct := &CodeTransfer{
+		Code:      code,
+		SenderID:  senderSession,
+		Files:     files,
+		FileMeta:  make([]StoredFile, len(files)),
+		CreatedAt: now,
+		ExpiresAt: now.Add(s.transferTTL), // Use the same TTL as direct transfers
+	}
+	for i, f := range files {
+		ct.FileMeta[i] = StoredFile{
+			ID:          f.ID,
+			Name:        f.Name,
+			ContentType: f.ContentType,
+			Size:        f.Size,
+			// No content in metadata
+		}
+	}
+
+	s.mu.Lock()
+	s.codeTransfers[code] = ct
+	s.mu.Unlock()
+
+	return ct
+}
+
+func (s *Store) GetCodeTransfer(code string) (*CodeTransfer, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ct, ok := s.codeTransfers[strings.ToUpper(code)]
+	return ct, ok
+}
+
+func (s *Store) DownloadCodeTransferFile(code, fileID string) (StoredFile, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ct, ok := s.codeTransfers[strings.ToUpper(code)]
+	if !ok {
+		return StoredFile{}, false
+	}
+	for _, f := range ct.Files {
+		if f.ID == fileID {
+			return f, true
+		}
+	}
+	return StoredFile{}, false
 }
 
 func (s *Store) Inbox(sessionID string) []Transfer {

@@ -86,6 +86,9 @@ func main() {
 	mux.HandleFunc("/api/transfers", srv.handleTransfers)
 	mux.HandleFunc("/api/transfers/inbox", srv.handleInbox)
 	mux.HandleFunc("/api/transfers/", srv.handleTransferDownload)
+	mux.HandleFunc("/api/transfers/encrypted/upload", srv.handleEncryptedUpload)
+	mux.HandleFunc("/api/transfers/encrypted/check", srv.handleEncryptedCheck)
+	mux.HandleFunc("/api/transfers/encrypted/download", srv.handleEncryptedDownload)
 	mux.HandleFunc("/api/locker/check", srv.handleLockerCheck)
 	mux.HandleFunc("/api/locker/create", srv.handleLockerCreate)
 	mux.HandleFunc("/api/locker/open", srv.handleLockerOpen)
@@ -295,6 +298,136 @@ func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		resp.Transfers = append(resp.Transfers, item)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// --- Encrypted Transfer Handlers ---
+
+func (s *server) handleEncryptedUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionID := r.URL.Query().Get("sessionId")
+	if sessionID == "" || !s.store.SessionExists(sessionID) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if err := r.ParseMultipartForm(500 << 20); err != nil { // 500 MB limit
+		http.Error(w, "unable to parse form", http.StatusBadRequest)
+		return
+	}
+
+	senderSession := r.FormValue("senderSession")
+	if senderSession != sessionID {
+		http.Error(w, "session mismatch", http.StatusUnauthorized)
+		return
+	}
+
+	s.store.TouchSession(sessionID)
+
+	formFiles := r.MultipartForm.File["files"]
+	if len(formFiles) == 0 {
+		http.Error(w, "no files provided", http.StatusBadRequest)
+		return
+	}
+	if len(formFiles) > 10 {
+		http.Error(w, "too many files (max 10)", http.StatusBadRequest)
+		return
+	}
+
+	var storedFiles []transfer.StoredFile
+	for _, fh := range formFiles {
+		f, err := fh.Open()
+		if err != nil {
+			http.Error(w, "unable to open file", http.StatusInternalServerError)
+			return
+		}
+		content, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			http.Error(w, "unable to read file", http.StatusInternalServerError)
+			return
+		}
+
+		contentType := fh.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = mime.TypeByExtension(path.Ext(fh.Filename))
+			if contentType == "" {
+				contentType = "application/octet-stream"
+			}
+		}
+		b := make([]byte, 16)
+		rand.Read(b)
+
+		storedFiles = append(storedFiles, transfer.StoredFile{
+			ID:          hex.EncodeToString(b),
+			Name:        fh.Filename,
+			ContentType: contentType,
+			Size:        fh.Size,
+			Content:     content,
+		})
+	}
+
+	ct := s.store.AddCodeTransfer(sessionID, storedFiles)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"code":    ct.Code,
+		"files":   ct.FileMeta,
+	})
+}
+
+func (s *server) handleEncryptedCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+
+	ct, exists := s.store.GetCodeTransfer(code)
+	if !exists {
+		http.Error(w, "invalid or expired code", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code":      ct.Code,
+		"senderId":  ct.SenderID,
+		"files":     ct.FileMeta,
+		"createdAt": ct.CreatedAt,
+		"expiresAt": ct.ExpiresAt,
+	})
+}
+
+func (s *server) handleEncryptedDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	fileID := strings.TrimSpace(r.URL.Query().Get("fileId"))
+	if code == "" || fileID == "" {
+		http.Error(w, "missing code or fileId", http.StatusBadRequest)
+		return
+	}
+
+	f, ok := s.store.DownloadCodeTransferFile(code, fileID)
+	if !ok {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", f.ContentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, f.Name))
+	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	w.WriteHeader(http.StatusOK)
+	w.Write(f.Content)
 }
 
 func (s *server) handleTransferDownload(w http.ResponseWriter, r *http.Request) {
