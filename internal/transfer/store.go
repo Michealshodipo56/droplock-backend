@@ -35,7 +35,7 @@ type LockerFile struct {
 	Name        string    `json:"name"`
 	ContentType string    `json:"contentType"`
 	Size        int64     `json:"size"`
-	Content     []byte    `json:"-"`
+	Content     []byte    `json:"content"`
 	UploadedAt  time.Time `json:"uploadedAt"`
 }
 
