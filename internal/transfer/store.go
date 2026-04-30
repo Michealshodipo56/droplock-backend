@@ -41,11 +41,11 @@ type LockerFile struct {
 
 type Locker struct {
 	Name          string                 `json:"name"`
-	PasswordHash  string                 `json:"-"`
-	RecoveryEmail string                 `json:"-"`
+	PasswordHash  string                 `json:"passwordHash"`
+	RecoveryEmail string                 `json:"recoveryEmail"`
 	CreatedAt     time.Time              `json:"createdAt"`
-	Notes         map[string]*Note       `json:"-"`
-	Files         map[string]*LockerFile `json:"-"`
+	Notes         map[string]*Note       `json:"notes"`
+	Files         map[string]*LockerFile `json:"files"`
 }
 
 type StoredFile struct {
@@ -86,41 +86,34 @@ type Store struct {
 	transfers       map[string]Transfer
 	transfersByTgt  map[string][]string
 	lockers         map[string]Locker
-	otps            map[string]otpEntry // key: lockerName
+	otps            map[string]otpEntry      // key: lockerName
 	codeTransfers   map[string]*CodeTransfer // key: code
 	offlineAfter    time.Duration
 	transferTTL     time.Duration
+	codeTransferTTL time.Duration
 	persistPath     string
 }
 
-func NewStore(offlineAfter, transferTTL time.Duration, persistPath string) *Store {
+func NewStore(offlineAfter, transferTTL, codeTransferTTL time.Duration, persistPath string) *Store {
 	s := &Store{
-		sessions:       make(map[string]Session),
-		transfers:      make(map[string]Transfer),
-		transfersByTgt: make(map[string][]string),
-		lockers:        make(map[string]Locker),
-		otps:           make(map[string]otpEntry),
-		codeTransfers:  make(map[string]*CodeTransfer),
-		offlineAfter:   offlineAfter,
-		transferTTL:    transferTTL,
-		persistPath:    persistPath,
+		sessions:        make(map[string]Session),
+		transfers:       make(map[string]Transfer),
+		transfersByTgt:  make(map[string][]string),
+		lockers:         make(map[string]Locker),
+		otps:            make(map[string]otpEntry),
+		codeTransfers:   make(map[string]*CodeTransfer),
+		offlineAfter:    offlineAfter,
+		transferTTL:     transferTTL,
+		codeTransferTTL: codeTransferTTL,
+		persistPath:     persistPath,
 	}
 	s.loadLockerData()
 	go s.cleanupLoop()
 	return s
 }
 
-type persistedLocker struct {
-	Name          string                 `json:"name"`
-	PasswordHash  string                 `json:"passwordHash"`
-	RecoveryEmail string                 `json:"recoveryEmail"`
-	CreatedAt     time.Time              `json:"createdAt"`
-	Notes         map[string]*Note       `json:"notes"`
-	Files         map[string]*LockerFile `json:"files"`
-}
-
 type lockerDataFile struct {
-	Lockers map[string]persistedLocker `json:"lockers"`
+	Lockers map[string]Locker `json:"lockers"`
 }
 
 func (s *Store) cleanupLoop() {
@@ -273,7 +266,7 @@ func (s *Store) AddCodeTransfer(senderSession string, files []StoredFile) *CodeT
 		Files:     files,
 		FileMeta:  make([]StoredFile, len(files)),
 		CreatedAt: now,
-		ExpiresAt: now.Add(s.transferTTL), // Use the same TTL as direct transfers
+		ExpiresAt: now.Add(s.codeTransferTTL),
 	}
 	for i, f := range files {
 		ct.FileMeta[i] = StoredFile{
@@ -626,7 +619,7 @@ func (s *Store) loadLockerData() {
 		return
 	}
 	if state.Lockers == nil {
-		state.Lockers = make(map[string]persistedLocker)
+		state.Lockers = make(map[string]Locker)
 	}
 	s.lockers = make(map[string]Locker, len(state.Lockers))
 	for key, item := range state.Lockers {
@@ -653,16 +646,9 @@ func (s *Store) persistLockerDataLocked() {
 	if s.persistPath == "" {
 		return
 	}
-	lockers := make(map[string]persistedLocker, len(s.lockers))
+	lockers := make(map[string]Locker, len(s.lockers))
 	for key, item := range s.lockers {
-		lockers[key] = persistedLocker{
-			Name:          item.Name,
-			PasswordHash:  item.PasswordHash,
-			RecoveryEmail: item.RecoveryEmail,
-			CreatedAt:     item.CreatedAt,
-			Notes:         item.Notes,
-			Files:         item.Files,
-		}
+		lockers[key] = item
 	}
 	state := lockerDataFile{Lockers: lockers}
 	payload, err := json.Marshal(state)

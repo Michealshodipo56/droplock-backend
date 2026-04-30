@@ -24,6 +24,7 @@ const (
 	maxUploadBytes   = int64(4 * 1024 * 1024 * 1024) // 4GB
 	offlineAfter     = 45 * time.Second
 	transferTTL      = 30 * time.Minute
+	codeTransferTTL  = 5 * time.Minute
 	defaultServeAddr = ":8080"
 )
 
@@ -74,7 +75,7 @@ func main() {
 		lockerDataPath = "droplock-data.json"
 	}
 	srv := &server{
-		store:          transfer.NewStore(offlineAfter, transferTTL, lockerDataPath),
+		store:          transfer.NewStore(offlineAfter, transferTTL, codeTransferTTL, lockerDataPath),
 		recoveryTokens: make(map[string]recoveryTokenEntry),
 	}
 	mux := http.NewServeMux()
