@@ -666,6 +666,14 @@ func (s *Store) persistLockerDataLocked() {
 	}
 }
 
+// FlushNow safely persists locker data to disk; call before shutdown.
+func (s *Store) FlushNow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persistLockerDataLocked()
+}
+
+
 func (s *Store) SetLockerEmail(name, passwordHash, email string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

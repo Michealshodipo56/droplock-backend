@@ -11,21 +11,24 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"droplock-backend/internal/transfer"
 )
 
 const (
-	maxUploadBytes   = int64(4 * 1024 * 1024 * 1024) // 4GB
-	offlineAfter     = 45 * time.Second
-	transferTTL      = 30 * time.Minute
-	codeTransferTTL  = 5 * time.Minute
-	defaultServeAddr = ":8080"
+	maxUploadBytes     = int64(2 * 1024 * 1024 * 1024) // 2GB (P2P transfers)
+	maxLockerFileBytes = int64(2 * 1024 * 1024 * 1024) // 2GB (locker file uploads)
+	offlineAfter       = 45 * time.Second
+	transferTTL        = 30 * time.Minute
+	codeTransferTTL    = 5 * time.Minute
+	defaultServeAddr   = ":8080"
 )
 
 type recoveryTokenEntry struct {
@@ -123,8 +126,22 @@ func main() {
 	}
 
 	h := withCORS(withRequestLog(mux))
+
+	srv2 := &http.Server{Addr: addr, Handler: h}
 	log.Printf("DropLock server listening on %s", addr)
-	if err := http.ListenAndServe(addr, h); err != nil {
+
+	// Graceful shutdown on SIGTERM / SIGINT
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-quit
+		log.Println("Shutdown signal received, flushing data...")
+		srv.store.FlushNow()
+		log.Println("Data flushed. Shutting down.")
+		os.Exit(0)
+	}()
+
+	if err := srv2.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }
@@ -675,6 +692,14 @@ func (s *server) handleLockerFileUpload(w http.ResponseWriter, r *http.Request) 
 	if len(headers) == 0 {
 		http.Error(w, "at least one file is required", http.StatusBadRequest)
 		return
+	}
+
+	// Enforce per-file 2GB limit
+	for _, header := range headers {
+		if header.Size > maxLockerFileBytes {
+			http.Error(w, fmt.Sprintf("file %q exceeds the 2 GB limit", header.Filename), http.StatusRequestEntityTooLarge)
+			return
+		}
 	}
 
 	var uploaded []map[string]any
